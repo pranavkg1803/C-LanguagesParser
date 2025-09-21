@@ -1,0 +1,742 @@
+options {
+  LOOKAHEAD = 4;
+}
+PARSER_BEGIN(Assignment)
+import java.io.*;
+import java.util.regex.*;
+import java.util.*;
+import java.lang.*;
+/**
+ * Simple brace matcher.
+ */
+public class Assignment {
+  public static HashSet<String> uniqueFunctionNames = new HashSet<>();
+  public static HashSet<String> uniqueParameterNames = new HashSet<>();
+  public static HashSet<String> allFunctionCalls =  new HashSet<>();
+
+
+  public static HashMap<String,String> functionHashMap = new HashMap<>();
+  // Copy of the function mapping used during cycle detection
+  public static HashMap<String,String> functionHashMapForLooping = new HashMap<>();
+
+  public static HashMap<String,List<String>> functionRelationships =  new HashMap<>();
+  // Directed graph for cycle detection
+  public static DirectedGraph graph = new DirectedGraph();
+  public static Boolean graphHasLoop = false;
+  public static int lineNumber = 1;
+
+  /**
+     * Main entry point of the application that processes the input script.
+     *
+     * @param args command line arguments (unused)
+     */
+  public static void main(String args[]) { //we can catch the exceptions here and give error messages
+    Assignment parser = new Assignment(System.in);
+    Boolean failed = false;
+    try{
+      parser.Input();
+      // Check for function calls that reference non-existent functions
+      HashSet<String> functionsCalledButDoNotExist = new HashSet<>(allFunctionCalls);
+      functionsCalledButDoNotExist.removeAll(uniqueFunctionNames);
+
+      if(!functionsCalledButDoNotExist.isEmpty()) {
+        int size = functionsCalledButDoNotExist.size();
+        Iterator<String> iterator = functionsCalledButDoNotExist.iterator();
+        String functionCalled = iterator.next(); // Retrieve the first value
+        throw new CustomParseException(size+" function call(s), to functions that do not exist, occured. Here is one of them: "+functionCalled); 
+      }
+      // Ensure that a main function is defined
+      if(!uniqueFunctionNames.contains("MAIN")){
+        throw new CustomParseException("0\nNo main function defined");
+      }
+      System.out.println("PASS");
+    } 
+    catch(ParseException e){
+      failed = true;
+      System.out.println("FAIL");
+      
+      handleParseException(e);
+      
+    } catch(Exception e){ //should never happen
+      System.err.println(e.getMessage());
+    }
+    
+    // Further analysis if parsing was successful
+    if(!failed){
+      if(doesLoop()){
+        System.out.println("LOOP");
+      } else {
+        String mainArithmatic = processMain();
+        int result = arithmatic(mainArithmatic);
+        System.out.println(result);
+      }
+    }
+  }
+
+  /**
+     * Checks for cyclic dependencies between functions using a directed graph.
+     *
+     * @return true if a cycle is detected, false otherwise
+     */
+  public static Boolean doesLoop(){
+    int noOfFunctions = uniqueFunctionNames.size();
+    String mainBody = functionHashMap.get("MAIN");
+    functionHashMapForLooping.put("MAIN",mainBody);
+    Set<String> functionNames = extractFunctions(mainBody);
+    
+    for(String functionName : functionNames){
+      graph.addEdge("MAIN", functionName); 
+    }
+    // Check for a cycle starting from the main function
+    if(graph.hasCycle()){
+      return true;
+    }
+    // Check other functions recursively
+    for(String functionName : functionNames){
+      doesLoopHelper(functionName);
+    }
+    
+    if(graph.hasCycle()) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+     * Helper method to recursively detect cycles in the function graph.
+     *
+     * @param functionName the name of the function to analyze
+     */
+  public static void doesLoopHelper(String functionName){
+
+    String body = functionHashMap.get(functionName);
+    if(functionHashMapForLooping.containsKey(functionName)) return;
+    // Extract all functions called within this function's body
+    Set<String> functionsCalled = extractFunctions(body);
+    for(String functionCalled : functionsCalled){ //if PLM does not loop eventually functionsCalled will be an empty set
+      graph.addEdge(functionName, functionCalled);
+    }
+    // Mark this function as processed for cycle detection
+    functionHashMapForLooping.put(functionName, body);
+    // Recursively process all functions called from this function
+    for(String functionCalled : functionsCalled){
+      doesLoopHelper(functionCalled);
+    } //recurse on each new function in the function body.
+    return;
+
+  }
+
+  /**
+     * Processes the "MAIN" function, replacing all function calls with their evaluated values.
+     *
+     * @return the fully evaluated arithmetic expression for the main function
+     */
+  static String processMain() {
+    //need to replace function calls by the actual function
+    String mainBody = functionHashMap.get("MAIN");
+    //System.out.println("Body of Main: "+mainBody);
+    while(findFirstUppercaseIndex(mainBody) != -1){ //we replace all function Calls with 
+      int indexFunctionStart = findFirstUppercaseIndex(mainBody);
+      int indexBracket1 = findFirstAfter(mainBody,'(',indexFunctionStart);
+      int bracketCounter = 1;
+      int indexBracket2 = indexBracket1+1;
+      // Find the closing parenthesis
+      while (indexBracket2 < mainBody.length()) {
+        if(mainBody.charAt(indexBracket2)=='(') bracketCounter++;
+        if(mainBody.charAt(indexBracket2)==')') bracketCounter--;
+        if(bracketCounter==0) break; //break while we are at the index of closing bracket.
+        indexBracket2++;
+      }
+      String functionCall = mainBody.substring(indexFunctionStart,indexBracket1);
+      String functionCallBody = mainBody.substring(indexBracket1+1,indexBracket2); //this becomes the parameter of the function we call
+      
+      String replacement = processFunction(functionCall, functionCallBody);
+
+      mainBody = mainBody.substring(0,indexFunctionStart) + "(" + replacement + ")" + mainBody.substring(indexBracket2+1);
+      //we replace the function call with this evaluation of it in brackets
+    }
+
+    return mainBody;
+  }
+
+  /**
+     * Evaluates a function call by replacing the parameter in the function body with the provided argument.
+     *
+     * @param function the name of the function being called
+     * @param argument the argument to the function call
+     * @return the evaluated function body with arguments replaced
+     */
+  static String processFunction(String function,String argument) { //all lowercase variables are replaced by our argument.
+    String mainBody = functionHashMap.get(function);
+    // Replace parameters with the argument in the function body
+    while(findFirstLowercaseIndex(mainBody)!=-1){ //we keep replacing the lowercase parameter with the arguement untill no parameters in the function
+      int indexParamStart = findFirstLowercaseIndex(mainBody);
+      int indexAfterParamEnd = indexParamStart;
+      
+      while (indexAfterParamEnd < mainBody.length() && Character.isLowerCase(mainBody.charAt(indexAfterParamEnd))) {
+        indexAfterParamEnd++;
+      }
+      if(argument.length()==1){
+        mainBody = mainBody.substring(0,indexParamStart) + argument + mainBody.substring(indexAfterParamEnd);
+      } else {
+      mainBody = mainBody.substring(0,indexParamStart) + "(" + argument + ")" + mainBody.substring(indexAfterParamEnd);
+      }
+      //System.out.println(function+": "+mainBody);
+    }
+    
+    // Replace nested function calls recursively
+    while(findFirstUppercaseIndex(mainBody) != -1){ //we replace all function Calls with 
+      int indexFunctionStart = findFirstUppercaseIndex(mainBody);
+      int indexBracket1 = findFirstAfter(mainBody,'(',indexFunctionStart);
+      int bracketCounter = 1;
+      int indexBracket2 = indexBracket1+1;
+      // Find the closing parenthesis
+      while (indexBracket2 < mainBody.length()) {
+        if(mainBody.charAt(indexBracket2)=='(') bracketCounter++;
+        if(mainBody.charAt(indexBracket2)==')') bracketCounter--;
+        if(bracketCounter==0) break; //break while we are at the index of closing bracket.
+        indexBracket2++;
+      }
+      // Extract the nested function call and its argument
+      String functionCall = mainBody.substring(indexFunctionStart,indexBracket1);
+      String functionCallBody = mainBody.substring(indexBracket1+1,indexBracket2); //this becomes the parameter of the function we call
+      String replacement = processFunction(functionCall, functionCallBody);
+
+      mainBody = mainBody.substring(0,indexFunctionStart) + "(" + replacement + ")" + mainBody.substring(indexBracket2+1);
+      //we replace the function call with this evaluation of it in brackets
+    }
+    //return our new function body with the argument instead of the parameter
+    return mainBody;
+  }
+
+  /**
+     * Finds the first index of an uppercase letter in a given string.
+     *
+     * @param str the input string
+     * @return index of the first uppercase letter, or -1 if none is found
+     */
+  public static int findFirstUppercaseIndex(String str) {
+    // Iterate over each character of the input string
+    for (int i = 0; i < str.length(); i++) {
+        // Check if the current character is uppercase
+        if (Character.isUpperCase(str.charAt(i))) {
+            return i; // Return the index when an uppercase letter is found
+        }
+    }
+    // Return -1 if no uppercase letter is found
+    return -1;
+  }
+
+  /**
+     * Finds the first index of a lowercase letter in a given string.
+     *
+     * @param str the input string
+     * @return index of the first lowercase letter, or -1 if none is found
+     */
+  public static int findFirstLowercaseIndex(String str) {
+    // Iterate over each character of the input string
+    for (int i = 0; i < str.length(); i++) {
+        // Check if the current character is uppercase
+        if (Character.isLowerCase(str.charAt(i))) {
+            return i; // Return the index when an uppercase letter is found
+        }
+    }
+    // Return -1 if no uppercase letter is found
+    return -1;
+  }
+
+  /**
+     * Finds the index of a specified character starting from a given index.
+     *
+     * @param str   the input string
+     * @param x     the character to search for
+     * @param start the starting index
+     * @return index of the specified character, or -1 if not found
+     */
+  public static int findFirstAfter(String str, char x, int start) {
+    // Iterate over each character of the input string
+    for (int i = start; i < str.length(); i++) {
+        // Check if the current character is correct
+        if (str.charAt(i)==x) {
+            return i; // Return the index is found
+        }
+    }
+    return -1;
+  }
+
+  /**
+     * Extracts all unique function names from a function body string.
+     *
+     * @param functionBody the function body string to analyze
+     * @return a set of unique function names
+     */
+  public static int findFirstOperatorAfter(String str, int start) {
+    // Iterate over each character of the input string
+    for (int i = start; i < str.length(); i++) {
+        // Check if the current character is correct
+        if (str.charAt(i)=='+') {
+          return i; // Return the index is found
+        }if (str.charAt(i)=='*') {
+          return i; // Return the index is found
+      }
+    }
+    return -1;
+  }
+
+  /**
+     * Evaluates an arithmetic expression represented as a string.
+     *
+     * @param arithmeticExpression the arithmetic expression string to evaluate
+     * @return the result of the arithmetic evaluation as an integer
+     */
+  public static int arithmatic(String expression) {
+    // Remove all spaces (not required here but useful in general cases)
+    expression = expression.replaceAll("\\s+", "");
+    
+    // arithmatic any inner expressions enclosed in brackets first
+    int bracketStart;
+    while ((bracketStart = expression.lastIndexOf('(')) != -1) {
+        int bracketEnd = expression.indexOf(')', bracketStart);
+        String subExpression = expression.substring(bracketStart + 1, bracketEnd);
+        int subResult = arithmatic(subExpression);
+        expression = expression.substring(0, bracketStart) + subResult + expression.substring(bracketEnd + 1);
+    }
+    
+    return arithmaticNoParentheses(expression);
+  }
+
+  /**
+     * Evaluates a mathematical expression that contains addition and multiplication,
+     * assuming there are no parentheses in the expression.
+     * 
+     * @param expression The arithmetic expression to evaluate as a string.
+     * @return The result of the arithmetic evaluation.
+     */
+  private static int arithmaticNoParentheses(String expression) {
+      // First arithmatic all multiplications
+      String[] additions = expression.split("\\+");
+      int result = 0;
+
+      for (String part : additions) {
+          String[] multiplications = part.split("\\*");
+          int subResult = 1;
+          for (String factor : multiplications) {
+              subResult *= Integer.parseInt(factor);
+          }
+          result += subResult;
+      }
+
+      return result;
+  }
+
+  /**
+     * Represents a basic data structure with a type, number, and parameter.
+     */
+  public static class Atom {
+    String type;
+    int number;
+    String parameter;
+
+
+  }
+
+  /**
+     * A class representing a directed graph structure.
+     * Vertices are identified by strings, and edges are directed.
+     */
+  public static class DirectedGraph {
+    private final Map<String, Integer> vertexIndices; // Maps vertex names to indices
+    private final List<List<Integer>> adj; // Adjacency list
+    private int currentIndex; // Tracks the next available index
+
+    // Constructor to initialize the graph
+    public DirectedGraph() {
+        vertexIndices = new HashMap<>();
+        adj = new ArrayList<>();
+        currentIndex = 0;
+    }
+
+    // Adds a new vertex name and assigns it an index
+    private int addVertex(String vertex) {
+        if (!vertexIndices.containsKey(vertex)) {
+            vertexIndices.put(vertex, currentIndex);
+            adj.add(new ArrayList<>());
+            return currentIndex++;
+        }
+        return vertexIndices.get(vertex);
+    }
+
+    // Adds a directed edge from the 'from' vertex to the 'to' vertex
+    public void addEdge(String from, String to) {
+        int fromIndex = addVertex(from);
+        int toIndex = addVertex(to);
+        adj.get(fromIndex).add(toIndex);
+    }
+
+    // Helper method for cycle detection
+    private boolean isCyclicUtil(int index, boolean[] visited, boolean[] recStack) {
+        if (recStack[index]) {
+            return true; // Cycle detected
+        }
+        if (visited[index]) {
+            return false; // No cycle detected for this path
+        }
+
+        // Mark this node as visited and part of the recursion stack
+        visited[index] = true;
+        recStack[index] = true;
+
+        // Check all neighbors for cycles
+        for (int neighbor : adj.get(index)) {
+            if (isCyclicUtil(neighbor, visited, recStack)) {
+                return true;
+            }
+        }
+
+        // Remove from recursion stack
+        recStack[index] = false;
+        return false;
+    }
+
+    // Method to detect if the graph has cycles
+    public boolean hasCycle() {
+        // Prepare arrays for visited nodes and the recursion stack
+        boolean[] visited = new boolean[currentIndex];
+        boolean[] recStack = new boolean[currentIndex];
+
+        // Check each vertex for cycles
+        for (int i = 0; i < currentIndex; i++) {
+            if (isCyclicUtil(i, visited, recStack)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Driver method to test the class functions
+    public static void main(String[] args) {
+        DirectedGraph graph = new DirectedGraph();
+        graph.addEdge("A", "B");
+        graph.addEdge("B", "C");
+        graph.addEdge("C", "D");
+        graph.addEdge("D", "E"); // Adding a cycle
+
+        if (graph.hasCycle()) {
+            System.out.println("Graph contains a cycle");
+        } else {
+            System.out.println("Graph does not contain a cycle");
+        }
+    }
+  }
+
+  /**
+     * Extracts function names from an expression string using a regular expression.
+     * 
+     * @param expression The expression string to analyze.
+     * @return A set of unique function names found in the expression.
+     */
+  public static Set<String> extractFunctions(String expression) {
+    // This pattern matches sequences of uppercase letters followed by a '('
+    Pattern pattern = Pattern.compile("\\b[A-Z]+(?=\\()");
+    Matcher matcher = pattern.matcher(expression);
+    Set<String> functions = new HashSet<>();
+
+    while (matcher.find()) {
+        functions.add(matcher.group());
+    }
+    return functions;
+  }
+
+  /**
+     * A custom exception class for parse errors.
+     */
+  public static class CustomParseException extends ParseException {
+    public CustomParseException(String message) {
+      super(message);
+    }
+  }
+
+  /**
+     * Handles parsing exceptions with detailed error messages, as
+     * accordance with Specification
+     * 
+     * @param e The ParseException instance to handle.
+     */
+  public static void handleParseException(ParseException e){
+
+    if(e instanceof CustomParseException){
+      System.err.println(e.getMessage());
+    } else {
+      Token failedToken = e.currentToken.next;
+      if(failedToken != null) {
+        
+        switch(failedToken.kind){
+          case AssignmentConstants.EOF:
+            System.err.println(lineNumber+"\nEOF character should be on its own line and on the last line of the file");
+            break;
+          case AssignmentConstants.DEF:
+            System.err.println(lineNumber+"\nFound DEF that is not spelt correctly, in all upper case and at the start of its own line");
+            break;
+          case AssignmentConstants.MAIN:
+            System.err.println(lineNumber+"\nMAIN is not spelt correctly, in all upper case after DEF keyword");
+            break;
+          case AssignmentConstants.LBRACE:
+            System.err.println(lineNumber+"\nThe left brace, '{' is not in the correct place in the line as it should be one space before function body and one space after function name.");
+            break;
+          case AssignmentConstants.RBRACE:
+            System.err.println(lineNumber+"\nThe right brace, '}' is not in the correct place in the line as it should be  one space after function body and one space before ;.");
+            break;
+          case AssignmentConstants.SPACE:
+            System.err.println(lineNumber+"\nThere is too large of a space on this line, between elements.");
+            break;
+          case AssignmentConstants.SEMICOLON:
+            System.err.println(lineNumber+"\nThe semi colon Should only be at the end of the line, one space after the right bracket.");
+            break;
+          case AssignmentConstants.ParameterName:
+            System.err.println(lineNumber+"\nThe parameter needs to be in only lower case letters, after a non-main function name, or within function body; also lower case letters should be used no where else in line");
+            break;
+          case AssignmentConstants.FunctionName:
+            System.err.println(lineNumber+"\nThe function name needs to be present with only capital letters and no other characters, after DEF keyword, or within a function call; also capital letters should be used no where except function name and DEF");
+            break;
+          case AssignmentConstants.Number:
+            System.err.println(lineNumber+"\nNumbers only should be in the function body between operators and there should be no numbers outside the functionBody");
+            break;
+          case AssignmentConstants.ADD:
+            System.err.println(lineNumber+"\nAddition operators need to only be in the function body, between 2 numbers, parameters or functionCalls, and no where else");
+            break;
+          case AssignmentConstants.MULTIPLY:
+            System.err.println(lineNumber+"\nMultiplication operators need to only be in the function body, between 2 numbers, parameters or functionCalls, and no where else");
+            break;
+          case AssignmentConstants.NewLine:
+            System.err.println(lineNumber+"\nLines of a PLM script must be on consecutive seperate lines in the file, seperated by exactly one new line character ");
+            break;
+          case AssignmentConstants.COMMENT:
+            System.err.println(lineNumber+"\nThis comment is not formatted correctly to PLM specification, with the correct delimeters, all on one line and the only thing on that");
+            break;
+          case AssignmentConstants.LNormalBrace:
+            System.err.println(lineNumber+"\nThe left normal bracket '(' should only be used in function calls within the function body and no where else");
+            break;
+          case AssignmentConstants.RNormalBrace:
+            System.err.println(lineNumber+"\nThe right normal bracket '(' should only be used in function calls within the function body and no where else");
+            break;
+          case AssignmentConstants.CatchAll:
+            System.err.println(lineNumber+"\nASCI character that are not allowed in PLM are in this line");
+            break;
+          default:
+          System.err.println(lineNumber+"\nThis line does not meet PLM specification");
+
+        }
+        
+        //System.err.println("Failure at the token: "+failedToken.image);
+      }else {
+        System.err.println(lineNumber+"\nNo token");
+      }
+
+    } 
+  } 
+  
+
+
+  
+}
+
+PARSER_END(Assignment)
+
+SKIP :{
+  <R: "\r">
+}
+
+TOKEN : //tokens are just reg ex
+{  
+  <DEF: "DEF"> //by having DEF as the first token function name will match to DEF first and be rejected
+| <MAIN: "MAIN">
+| <LBRACE: "{">
+| <RBRACE: "}">
+| <SPACE: " ">
+| <SEMICOLON: ";">
+| <ParameterName: (["a"-"z"])+>
+| <FunctionName: (["A"-"Z"])+>
+| <Number: ["1"-"9"] (["0"-"9"])* | "0">
+| <ADD: "+">
+| <MULTIPLY: "*">
+| <NewLine: "\n">
+| <COMMENT: "/*" ( ~["*","\n"] | "*" ~["/","\n"] )* "*/" | "/*/" >
+| <LNormalBrace: "(">
+| <RNormalBrace: ")">
+| <CatchAll: ~["0"-"9","a"-"z","A"-"Z","+",";","{","}","*","/","(",")","\n"," "]>
+}
+
+/**
+ * The root production of the parser. It processes lines of input until EOF is reached.
+ */
+void Input() :
+{}
+{
+  (line())* mainFunction() (line())* <EOF> 
+  //main is optional because we do a manual check later
+}
+/**
+ * Parses a single line which might be a comment or a function definition.
+ */
+void line() :
+{}
+{
+   comment()|function()
+}
+/**
+ * Parses comments and increments the line counter.
+ */
+void comment() :
+{}
+{
+  try { <COMMENT> }catch(ParseException e){ throw new CustomParseException(lineNumber+"\nThe comment line is not well formed with correct delimiters.");}
+  try { <NewLine> }catch(ParseException e){ throw new CustomParseException(lineNumber+"\nThe comment line must end in exactly one new line character, making it on its own line");}
+  {lineNumber++;}
+}
+
+/**
+ * Parses a function definition including its name, parameters, and body.
+ */
+void function() :
+{Token t; String functionName; Token t2; Token t3; String bodyString;
+  String parameterName; }
+{
+  try{ <DEF> } catch(ParseException e){ throw new CustomParseException(lineNumber+"\nThere needs to be a DEF keyword at the very start of the function line spelt in all capital letters");}
+  <SPACE>
+  try{ t=<FunctionName> } catch(ParseException e){ throw new CustomParseException(lineNumber+"\nFunction name should only be in all capital letters and come exactly 1 space after DEF keyword");}
+    {
+      functionName = t.image; //extracting string from the token
+      if(functionName.equals("DEF")){
+        throw new CustomParseException(lineNumber+"\nDEF can not be the function name"); //eventually these thrown errors will need to change to passing errors via error handling
+      }if (uniqueFunctionNames.contains(functionName)){
+        throw new CustomParseException(lineNumber+"\nThe function "+t.image+" was defined multiple times!");
+      }
+      uniqueFunctionNames.add(functionName); //we add the FunctionName to the hashset to keep track of all Fnames.
+    }
+  
+  <SPACE>
+  try{ t2=<ParameterName> } catch(ParseException e){ throw new CustomParseException(lineNumber+"\nParameter name must be only all lower case letters exactly one space after function name and one space before left brace"); } 
+  {
+    parameterName = t2.image;
+    uniqueParameterNames.add(parameterName);
+  }
+  <SPACE>
+  try{ <LBRACE> } catch(ParseException e){ throw new CustomParseException(lineNumber+"\nIn function there should exist a { one space before function body and one space after function name"); } 
+  <SPACE>
+  bodyString=body(parameterName) 
+  <SPACE>
+  try{ <RBRACE> } catch(ParseException e){ throw new CustomParseException(lineNumber+"\nIn function there should exist a } one space after function body and one space before ;"); } 
+  <SPACE>
+  try{ <SEMICOLON> } catch(ParseException e){ throw new CustomParseException(lineNumber+"\nFunction definition should end in a ; exactly one space after closing bracket"); } 
+  try { <NewLine> }catch(ParseException e){ throw new CustomParseException(lineNumber+"\nThe function line must end in exactly one new line character, making it on its own line");}
+  {functionHashMap.put(functionName,bodyString);
+  lineNumber++;}
+
+}
+
+/**
+ * Parses the "MAIN" function which is special and does not take parameters.
+ */
+void mainFunction() :
+{String bodyContent;}
+{
+  
+  <DEF>// } catch(ParseException e){ throw new CustomParseException(lineNumber+"\nThere needs to be a DEF keyword at start of this line for the Main function line");}
+  <SPACE>
+  <MAIN> //} catch(ParseException e){ throw new CustomParseException(lineNumber+"\nThere should be a MAIN keyword after DEF in a main function, spelt in all capital letters");}
+  <SPACE>
+  try{ <LBRACE> } catch(ParseException e){ throw new CustomParseException(lineNumber+"\nIn main function there should exist a { one space after MAIN and one space before function body"); }
+  <SPACE>
+  bodyContent=body("thisparameterwillneverbeused")
+  <SPACE>
+  try{ <RBRACE> } catch(ParseException e){ throw new CustomParseException(lineNumber+"\nIn main function there should exist a } one space after function body and one space before ;"); } 
+  <SPACE>
+  try{ <SEMICOLON> } catch(ParseException e){ throw new CustomParseException(lineNumber+"\nMain function definition should end in a ; exactly one space after closing bracket"); } 
+  try { <NewLine> }catch(ParseException e){ throw new CustomParseException(lineNumber+"\nThe main function line must end in exactly one new line character, making it on its own line");}
+  {functionHashMap.put("MAIN",bodyContent);
+   uniqueFunctionNames.add("MAIN");
+   lineNumber++;}
+}
+
+/**
+ * Parses the body of a function and constructs a string representation of its content.
+ * @param currParameterName The name of the parameter for the function being parsed.
+ * @return A string that represents the function body.
+ */
+String body(String currParameterName) : //should have no spaces hence why we don't skip
+{String s1,s2 = "";}
+{
+  try{
+  s1=term(currParameterName) 
+  ( 
+     <ADD> 
+    s2=term(currParameterName) 
+    { 
+      s1=s1+"+"+s2;} 
+  )*
+  
+  {return s1;}
+
+  } catch(ParseException e){
+    if(e instanceof CustomParseException){
+       throw (CustomParseException) e;
+    } else {
+      throw new CustomParseException(lineNumber+"\nFunction Body is not: wellformed with only numbers,parameters and function calls as restricted by PLM specification");
+    }
+  }
+}
+
+/**
+ * Parses a term, which is a component of an arithmetic expression.
+ * A term consists of atoms separated by multiplication operators.
+ * 
+ * @param currParameterName The name of the current function parameter, used to verify parameter references.
+ * @return A string representing the parsed term, including all sub-terms and multiplication operators.
+ */
+String term(String currParameterName) :
+{String s1,s2 = "";}
+{
+  s1=atom(currParameterName) 
+  (
+    <MULTIPLY>
+    s2=atom(currParameterName)
+    { s1=s1+"*"+s2;} 
+  )*
+  {return s1;}
+}
+
+
+/**
+ * Parses an atom, the smallest component of an arithmetic expression.
+ * An atom can be a number, a function parameter, or a function call.
+ * 
+ * @param currParameterName The name of the current function parameter, used to validate references.
+ * @return A string representing the parsed atom.
+ * @throws CustomParseException if an invalid parameter or function name is used.
+ */
+String atom(String currParameterName) :
+{Token t1=null; String functionCalled; Token t2=null; String parameterName;
+ Token t3=null; String bodyContent = "";}
+{
+   
+  ( t3=<Number> | t1=<ParameterName> | t2=<FunctionName> <LNormalBrace> bodyContent=body(currParameterName) <RNormalBrace>)
+  {
+    if(t3!=null){
+      return t3.image;
+    }
+    if(t1!=null){ //if the term is a parameter
+      parameterName = t1.image; //this will be the only lower case letters
+      if(!parameterName.equals(currParameterName)) throw new CustomParseException(lineNumber+"\nUsed the invalid parameter name "+t1.image);
+      return parameterName;
+    }if(t2!=null && bodyContent!=""){ //if the term is a functionCall
+      functionCalled = t2.image;
+      allFunctionCalls.add(functionCalled);
+      if(functionCalled.equals("MAIN")) throw new CustomParseException(lineNumber+"\nTried to call the MAIN function which can not be called");
+      return functionCalled+"("+bodyContent+")";
+    }
+  }
+}
+
+
+
